@@ -16,8 +16,8 @@ logger = logging.getLogger("ada_workbench.vision")
 
 # Ollama Host & Vision Model Configuration
 # In Docker containers, host.docker.internal / docker.internal routes to the host machine.
-DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen2.5-vl:7b")
+DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
 VISION_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_VISION_TIMEOUT", "600.0"))
 
 # Default domain prompt fallback for industrial blueprint analysis
@@ -110,6 +110,14 @@ async def parse_schematic_with_qwen(image_bytes: bytes, user_query: str) -> Dict
             # 5. Extract structured visual analysis text response
             message_block = data.get("message", {})
             analysis_text = message_block.get("content", "")
+            if not isinstance(analysis_text, str) or not analysis_text.strip():
+                return {
+                    "status": "error",
+                    "model": data.get("model", VISION_MODEL),
+                    "analysis": "",
+                    "metadata": None,
+                    "error": "Ollama returned no usable vision analysis.",
+                }
 
             logger.info("Successfully analyzed schematic with %s", VISION_MODEL)
             return {

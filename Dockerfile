@@ -11,6 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         curl \
+        poppler-utils \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a dedicated non-privileged user and group for application execution

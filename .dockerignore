@@ -16,3 +16,5 @@ docker-compose*.yml
 .dockerignore
 Dockerfile
 README.md
+models/
+wheelhouse/

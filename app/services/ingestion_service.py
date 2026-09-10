@@ -10,6 +10,8 @@ import re
 import time
 from typing import Any, Dict, List, Tuple
 
+from app.services.document_service import extract_local_text
+
 logger = logging.getLogger("ada_workbench.ingestion")
 
 # PII & Confidentiality Regex Patterns
@@ -72,8 +74,16 @@ def scrub_pii(text: str) -> Tuple[str, List[Dict[str, Any]]]:
         matches = pattern.findall(sanitized)
         if matches:
             count = len(matches)
-            # Perform replacement
-            sanitized = pattern.sub(replacement, sanitized)
+            # Preserve the original personnel label while replacing only the
+            # identified name. A static "Approved By" replacement would alter
+            # the meaning of "Inspected By" and "Checked By" records.
+            if label == "INSPECTOR_NAME":
+                sanitized = pattern.sub(
+                    lambda match: f"{match.group(0).split(':', 1)[0]}: [REDACTED_PERSONNEL]",
+                    sanitized,
+                )
+            else:
+                sanitized = pattern.sub(replacement, sanitized)
             redaction_log.append({
                 "type": label,
                 "occurrences": count,
@@ -88,6 +98,7 @@ def process_uploaded_asset(
     filename: str,
     content_bytes: bytes,
     optional_text_notes: str = "",
+    content_type: str = "",
 ) -> Dict[str, Any]:
     """
     Full Stage 1 Ingestion Pipeline:
@@ -105,11 +116,19 @@ def process_uploaded_asset(
     """
     logger.info("Initiating Stage 1 Ingestion for file: %s (%d bytes)", filename, len(content_bytes))
 
+    # 0. Local document inspection.  The extractor is offline-only and returns
+    # an explicit warning when a parser/OCR runtime is not provisioned.
+    extraction = extract_local_text(filename, content_bytes, content_type or None)
+    extracted_text = extraction.get("text", "")
+    combined_text = "\n\n".join(
+        part.strip() for part in (optional_text_notes or "", extracted_text) if part and part.strip()
+    )
+
     # 1. Cryptographic SHA-256 Hashing
     sha256_hash = compute_sha256(content_bytes)
 
     # 2. PII Scrubbing
-    scrubbed_notes, redactions = scrub_pii(optional_text_notes)
+    scrubbed_notes, redactions = scrub_pii(combined_text)
 
     # 3. Build Sovereign Ingestion Manifest
     manifest = {
@@ -118,11 +137,23 @@ def process_uploaded_asset(
         "filename": filename,
         "byte_size": len(content_bytes),
         "sha256_digest": sha256_hash,
+        "asset_type": extraction.get("asset_type", "binary"),
+        "content_type": extraction.get("content_type"),
+        "text_extraction": {
+            "method": extraction.get("method", "not_applicable"),
+            "page_count": extraction.get("page_count"),
+            "warnings": extraction.get("warnings", []),
+            "characters_extracted": len(extracted_text),
+        },
         "pii_scrubbed": len(redactions) > 0,
         "redaction_count": sum(r["occurrences"] for r in redactions),
         "redactions": redactions,
         "sanitized_notes": scrubbed_notes,
-        "airgap_verified": True,
+        "sanitized_extracted_text": scrub_pii(extracted_text)[0] if extracted_text else "",
+        # Ingestion can attest to the asset hash and redaction activity, but
+        # it cannot independently prove the deployment network perimeter.
+        "airgap_verified": False,
+        "airgap_status": "not_verified_by_ingestion",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 

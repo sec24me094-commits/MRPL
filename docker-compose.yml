@@ -31,10 +31,19 @@ services:
       - QDRANT_URL=http://ada-vector-db:6333
       - DOCKER_HOST=unix:///var/run/docker.sock
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_TIMEOUT_SECONDS=600.0
+      - OLLAMA_VISION_TIMEOUT=600.0
+      - OLLAMA_VISION_MODEL=qwen2.5vl:7b
+      - SANDBOX_TIMEOUT_SECONDS=60
+      - ADA_BGE_MODEL_PATH=/app/models/bge-large-en-v1.5
+      - ADA_BGE_MODEL_NAME=BAAI/bge-large-en-v1.5
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./models:/app/models:ro
+      - ./app:/app/app
     depends_on:
       ada-vector-db:
         condition: service_healthy
