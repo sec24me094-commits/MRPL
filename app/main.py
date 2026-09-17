@@ -27,7 +27,7 @@ import io
 import zipfile
 from pathlib import Path
 
-from app.agents.orchestrator import route_and_execute_task
+from app.agents.orchestrator import route_and_execute_task, stream_route_and_execute_task
 from app.agents.vision_agent import parse_schematic_with_qwen
 from app.services.compiler_service import (
     compile_approval_note_docx,
@@ -40,6 +40,8 @@ from app.services.models_service import models_service
 from app.services.rag_service import rag_service
 from app.services.security_service import sovereignty_posture
 from app.services.wireshark_service import wireshark_service
+
+ACTIVE_CHAT_TASKS: Dict[str, asyncio.Task] = {}
 
 # Configure structured logging
 logging.basicConfig(
@@ -118,6 +120,18 @@ class ChatRequest(BaseModel):
     file_metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional Stage 1 ingestion metadata (SHA-256 digest, filename)",
+    )
+    model_tag: Optional[str] = Field(
+        default=None,
+        description="Optional model tag override (e.g. deepseek-r1:8b, llama3:latest)",
+    )
+    think_mode: Optional[bool] = Field(
+        default=True,
+        description="Enable deep reasoning mode with live thinking stream",
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session identifier for cancellation and tracking",
     )
 
     @field_validator("image_base64")
@@ -360,20 +374,53 @@ async def chat_and_execute(payload: ChatRequest):
             await http_client.aclose()
 
 
-# ── Stage 4: Secure Output Compilation ───────────────────────────────────────
+# ── Stop & Cancellation Endpoint ───────────────────────────────────────────
+@app.post(
+    "/api/v1/chat/stop",
+    tags=["Stage 2 & 3 - Orchestration & Execution"],
+    summary="Interrupt and cancel an active generation session immediately",
+)
+async def stop_chat_generation(payload: ChatStopRequest):
+    """Real-time cancellation of in-flight inference stream."""
+    session_id = payload.session_id
+    cancelled = False
+    if session_id and session_id in ACTIVE_CHAT_TASKS:
+        task = ACTIVE_CHAT_TASKS.get(session_id)
+        if task and not task.done():
+            task.cancel()
+            cancelled = True
+        ACTIVE_CHAT_TASKS.pop(session_id, None)
+
+    if not session_id:
+        for s_id, task in list(ACTIVE_CHAT_TASKS.items()):
+            if not task.done():
+                task.cancel()
+                cancelled = True
+        ACTIVE_CHAT_TASKS.clear()
+
+    return {
+        "status": "stopped" if cancelled else "no_active_task",
+        "session_id": session_id,
+        "message": "Generation stream interrupted and stopped by operator." if cancelled else "No active generation in progress.",
+    }
+
+
+# ── Stage 2 & 3: Real-Time SSE Chat Streaming ─────────────────────────────────
 @app.post(
     "/api/v1/chat/stream",
     tags=["Stage 2 & 3 - Orchestration & Execution"],
-    summary="Stream safe live orchestration activity followed by the final response",
+    summary="Stream live tokens, real-time reasoning thought disclosure, and stage activity",
 )
 async def chat_and_stream(payload: ChatRequest):
-    """Stream high-level model activity without exposing private chain-of-thought."""
+    """
+    Real-Time ChatGPT Streaming Pipeline:
+    - Streams live reasoning thoughts (DeepSeek-R1 <think> tokens)
+    - Streams real-time answer tokens (word-by-word)
+    - Streams RAG retrieval, sandbox verification, and final compliance artifacts
+    """
+    session_id = payload.session_id or f"session_{int(time.time()*1000)}"
+
     async def event_stream():
-        activity_queue: asyncio.Queue = asyncio.Queue()
-
-        async def publish(event: Dict[str, Any]):
-            await activity_queue.put(event)
-
         http_client = client_state.get("http_client")
         owns_http_client = False
         if http_client is None:
@@ -383,68 +430,67 @@ async def chat_and_stream(payload: ChatRequest):
             )
             owns_http_client = True
 
-        task = asyncio.create_task(
-            route_and_execute_task(
+        def sse(event_name: str, data: Dict[str, Any]) -> str:
+            return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        yield sse("activity", {"stage": "system", "message": "Ada session initialized.", "status": "active"})
+
+        try:
+            async for ev_name, ev_data in stream_route_and_execute_task(
                 user_prompt=payload.user_prompt,
                 http_client=http_client,
                 image_base64=payload.image_base64,
                 file_metadata=payload.file_metadata,
-                activity_callback=publish,
+                model_tag=payload.model_tag,
+                think_mode=payload.think_mode if payload.think_mode is not None else True,
+            ):
+                yield sse(ev_name, ev_data)
+        except asyncio.CancelledError:
+            logger.info("Session %s generation cancelled by client or stop request.", session_id)
+            yield sse("activity", {"stage": "system", "message": "Generation stopped by operator.", "status": "stopped"})
+            return
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.TimeoutException) as conn_err:
+            matching_sops = rag_service.search_sops(payload.user_prompt)
+            sop_summary = "\n".join(f"- {s['id']}: {s['clause']}" for s in matching_sops)
+            fallback_answer = (
+                "The local reasoning model is unreachable, so ADA cannot issue a compliance conclusion "
+                "or claim sandbox verification. Review the local SOPs below and retry when Ollama is healthy.\n\n"
+                f"### Potentially relevant local SOPs\n{sop_summary}"
             )
-        )
-
-        def sse(event_name: str, data: Dict[str, Any]) -> str:
-            return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-        try:
-            yield sse("activity", {"stage": "system", "message": "Ada session started.", "status": "active"})
-            while not task.done() or not activity_queue.empty():
-                try:
-                    event = await asyncio.wait_for(activity_queue.get(), timeout=0.25)
-                    yield sse("activity", event)
-                except asyncio.TimeoutError:
-                    continue
-
-            try:
-                result = task.result()
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.TimeoutException) as conn_err:
-                matching_sops = rag_service.search_sops(payload.user_prompt)
-                sop_summary = "\n".join(f"- {s['id']}: {s['clause']}" for s in matching_sops)
-                result = {
-                    "status": "degraded",
-                    "verification_status": "unverified",
-                    "routed_to": "local_sop_fallback",
-                    "model": None,
-                    "final_answer": (
-                        "The local reasoning model is unavailable, so ADA cannot issue a compliance conclusion "
-                        "or claim sandbox verification. Review the local SOPs below and retry when Ollama is healthy.\n\n"
-                        f"### Potentially relevant local SOPs\n{sop_summary}"
-                    ),
-                    "code_executed": None,
-                    "sandbox_result": {"executed": False, "status": "not_run", "reason": "Reasoning model unavailable."},
-                    "self_correction_attempts": 0,
-                    "correction_history": [],
-                    "grounding_sops": matching_sops,
-                    "file_attestation": payload.file_metadata,
-                    "warnings": [f"Ollama is unavailable at {DEFAULT_OLLAMA_HOST}.", str(conn_err)],
-                }
-                yield sse("activity", {"stage": "system", "message": "Model unavailable; returned an unverified local SOP fallback.", "status": "error"})
-            except Exception as exc:
-                logger.exception("Streaming chat failed: %s", exc)
-                yield sse("error", {"message": f"Pipeline error: {exc}"})
-                return
-
+            yield sse("token", {"chunk": fallback_answer})
+            result = {
+                "status": "degraded",
+                "verification_status": "unverified",
+                "routed_to": "local_sop_fallback",
+                "model": None,
+                "final_answer": fallback_answer,
+                "thought": "",
+                "code_executed": None,
+                "sandbox_result": {"executed": False, "status": "not_run", "reason": "Reasoning model unavailable."},
+                "self_correction_attempts": 0,
+                "correction_history": [],
+                "grounding_sops": matching_sops,
+                "file_attestation": payload.file_metadata,
+                "warnings": [f"Ollama is unavailable at {DEFAULT_OLLAMA_HOST}.", str(conn_err)],
+            }
+            yield sse("activity", {"stage": "system", "message": "Model unavailable; returned local SOP fallback.", "status": "error"})
             yield sse("done", result)
+        except Exception as exc:
+            logger.exception("Streaming chat failed for session %s: %s", session_id, exc)
+            yield sse("error", {"message": f"Pipeline error: {exc}"})
         finally:
-            if not task.done():
-                task.cancel()
+            ACTIVE_CHAT_TASKS.pop(session_id, None)
             if owns_http_client:
                 await http_client.aclose()
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

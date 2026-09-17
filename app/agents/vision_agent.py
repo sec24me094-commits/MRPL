@@ -5,9 +5,10 @@ using Qwen2.5-VL:7b running locally via Ollama.
 """
 
 import base64
+import json
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -29,38 +30,14 @@ DEFAULT_PROMPT = (
 )
 
 
-async def parse_schematic_with_qwen(image_bytes: bytes, user_query: str) -> Dict[str, Any]:
+async def parse_schematic_with_qwen(
+    image_bytes: bytes,
+    user_query: str,
+    token_callback: Optional[Any] = None,
+) -> Dict[str, Any]:
     """
     Asynchronously submits an engineering schematic or blueprint image to the local
-    Ollama instance running qwen2.5-vl:7b.
-
-    Ollama Multimodal Schema:
-    POST /api/chat
-    {
-        "model": "qwen2.5-vl:7b",
-        "messages": [
-            {
-                "role": "user",
-                "content": "<analysis_instructions>",
-                "images": ["<base64_encoded_image_string>"]
-            }
-        ],
-        "stream": false
-    }
-
-    Args:
-        image_bytes (bytes): Raw binary bytes of the uploaded schematic image (PNG, JPEG, etc.).
-        user_query (str): Engineering prompt/query guiding the extraction focus.
-
-    Returns:
-        Dict[str, Any]: Structured dictionary containing:
-            {
-                "status": "success" | "error",
-                "model": str,
-                "analysis": str,
-                "metadata": Optional[Dict[str, Any]],
-                "error": Optional[str]
-            }
+    Ollama instance running qwen2.5-vl:7b. Supports live token-by-token streaming.
     """
     if not image_bytes:
         return {
@@ -71,13 +48,14 @@ async def parse_schematic_with_qwen(image_bytes: bytes, user_query: str) -> Dict
             "error": "Input image_bytes is empty. Provide a valid schematic image file.",
         }
 
-    # 3. Encode the raw blueprint / P&ID image_bytes into standard base64 string
+    # Encode the raw blueprint / P&ID image_bytes into standard base64 string
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     # Combine domain-specific context with user's specific analysis query
     prompt_content = user_query.strip() if user_query and user_query.strip() else DEFAULT_PROMPT
 
-    # 2. Format payload specifically for qwen2.5-vl:7b under Ollama /api/chat specification
+    stream_mode = token_callback is not None
+
     payload = {
         "model": VISION_MODEL,
         "messages": [
@@ -87,7 +65,7 @@ async def parse_schematic_with_qwen(image_bytes: bytes, user_query: str) -> Dict
                 "images": [base64_image],
             }
         ],
-        "stream": False,
+        "stream": stream_mode,
     }
 
     timeout_config = httpx.Timeout(
@@ -98,41 +76,65 @@ async def parse_schematic_with_qwen(image_bytes: bytes, user_query: str) -> Dict
     )
 
     endpoint = f"{DEFAULT_OLLAMA_HOST.rstrip('/')}/api/chat"
-    logger.info("Dispatching schematic to %s at %s", VISION_MODEL, endpoint)
+    logger.info("Dispatching schematic to %s at %s (streaming=%s)", VISION_MODEL, endpoint, stream_mode)
 
-    # 1. Use httpx to make asynchronous POST request
     try:
         async with httpx.AsyncClient(timeout=timeout_config) as client:
-            response = await client.post(endpoint, json=payload)
-            response.raise_for_status()
-            data = response.json()
-
-            # 5. Extract structured visual analysis text response
-            message_block = data.get("message", {})
-            analysis_text = message_block.get("content", "")
-            if not isinstance(analysis_text, str) or not analysis_text.strip():
+            if stream_mode:
+                analysis_chunks = []
+                req = client.build_request("POST", endpoint, json=payload)
+                resp = await client.send(req, stream=True)
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk_data = json.loads(line)
+                        content = chunk_data.get("message", {}).get("content", "")
+                        if content:
+                            analysis_chunks.append(content)
+                            if token_callback:
+                                await token_callback(content)
+                    except Exception as parse_err:
+                        logger.debug("Failed parsing vision stream chunk: %s", parse_err)
+                analysis_text = "".join(analysis_chunks)
                 return {
-                    "status": "error",
-                    "model": data.get("model", VISION_MODEL),
-                    "analysis": "",
-                    "metadata": None,
-                    "error": "Ollama returned no usable vision analysis.",
+                    "status": "success",
+                    "model": VISION_MODEL,
+                    "analysis": analysis_text,
+                    "metadata": {"streamed": True},
+                    "error": None,
                 }
+            else:
+                response = await client.post(endpoint, json=payload)
+                response.raise_for_status()
+                data = response.json()
 
-            logger.info("Successfully analyzed schematic with %s", VISION_MODEL)
-            return {
-                "status": "success",
-                "model": data.get("model", VISION_MODEL),
-                "analysis": analysis_text,
-                "metadata": {
-                    "total_duration_ns": data.get("total_duration"),
-                    "load_duration_ns": data.get("load_duration"),
-                    "prompt_eval_count": data.get("prompt_eval_count"),
-                    "eval_count": data.get("eval_count"),
-                    "done": data.get("done", True),
-                },
-                "error": None,
-            }
+                message_block = data.get("message", {})
+                analysis_text = message_block.get("content", "")
+                if not isinstance(analysis_text, str) or not analysis_text.strip():
+                    return {
+                        "status": "error",
+                        "model": data.get("model", VISION_MODEL),
+                        "analysis": "",
+                        "metadata": None,
+                        "error": "Ollama returned no usable vision analysis.",
+                    }
+
+                logger.info("Successfully analyzed schematic with %s", VISION_MODEL)
+                return {
+                    "status": "success",
+                    "model": data.get("model", VISION_MODEL),
+                    "analysis": analysis_text,
+                    "metadata": {
+                        "total_duration_ns": data.get("total_duration"),
+                        "load_duration_ns": data.get("load_duration"),
+                        "prompt_eval_count": data.get("prompt_eval_count"),
+                        "eval_count": data.get("eval_count"),
+                        "done": data.get("done", True),
+                    },
+                    "error": None,
+                }
 
     except httpx.ConnectError as conn_err:
         logger.error("Failed to reach Ollama endpoint at %s: %s", DEFAULT_OLLAMA_HOST, conn_err)

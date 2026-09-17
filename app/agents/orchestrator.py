@@ -6,6 +6,7 @@ self-correction explicit nodes that can be logged and audited independently.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -28,6 +29,8 @@ MAX_SELF_CORRECTION_ATTEMPTS = int(os.getenv("MAX_SELF_CORRECTION_ATTEMPTS", "2"
 PYTHON_CODE_REGEX = re.compile(r"```(?:python)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
 
 
+import json
+
 class AdaGraphState(TypedDict, total=False):
     user_prompt: str
     http_client: Any
@@ -38,13 +41,20 @@ class AdaGraphState(TypedDict, total=False):
     route: str
     matching_sops: List[Dict[str, Any]]
     rag_context_str: str
+    visual_extraction_str: Optional[str]
     llm_response: str
+    llm_thought: str
     vision_result: Dict[str, Any]
     code_block: Optional[str]
     sandbox_result: Dict[str, Any]
     correction_history: List[Dict[str, Any]]
     attempts: int
     activity_callback: Any
+    token_callback: Any
+    thought_callback: Any
+    event_callback: Any
+    model_tag: Optional[str]
+    think_mode: bool
     verification_certificate: Dict[str, Any]
     result: Dict[str, Any]
 
@@ -66,8 +76,21 @@ async def call_deepseek_reasoner(
     http_client: httpx.AsyncClient,
     prompt: str,
     rag_context: Optional[str] = None,
-) -> str:
-    """Call the local DeepSeek model with local SOP context."""
+    model_tag: Optional[str] = None,
+    token_callback: Optional[Any] = None,
+    thought_callback: Optional[Any] = None,
+    think_mode: bool = True,
+) -> tuple[str, str]:
+    """
+    Calls the sovereign model runtime with live token and reasoning chunk streaming.
+    Returns (final_answer, accumulated_thought).
+    """
+    target_model = model_tag or os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
+
+    # If think_mode is disabled and user requested deepseek-r1, use fast direct model
+    if not think_mode and (target_model == "deepseek-r1:8b" or "deepseek-r1" in target_model):
+        target_model = os.getenv("FAST_MODEL", "llama3:latest")
+
     system_instruction = (
         "You are the sovereign AI engineering core of ADA WORKBENCH on MRPL premises. "
         "Analyze industrial refinery problems, verify against supplied local SOP clauses, "
@@ -75,16 +98,102 @@ async def call_deepseek_reasoner(
     )
     if rag_context:
         system_instruction += f"\n[AUTHORITATIVE LOCAL SOP CLAUSES]:\n{rag_context}\n"
-    response = await http_client.post(
-        "/api/generate",
-        json={
-            "model": REASONING_MODEL,
-            "prompt": f"{system_instruction}\nUSER INQUIRY:\n{prompt}\n",
-            "stream": False,
-        },
-    )
-    response.raise_for_status()
-    return response.json().get("response", "")
+
+    stream_mode = (token_callback is not None or thought_callback is not None)
+
+    payload = {
+        "model": target_model,
+        "prompt": f"{system_instruction}\nUSER INQUIRY:\n{prompt}\n",
+        "stream": stream_mode,
+    }
+
+    if not stream_mode:
+        response = await http_client.post("/api/generate", json=payload)
+        response.raise_for_status()
+        full_text = response.json().get("response", "")
+        # Check if full_text contains <think>
+        thought = ""
+        answer = full_text
+        if "<think>" in full_text and "</think>" in full_text:
+            parts = full_text.split("</think>", 1)
+            thought = parts[0].replace("<think>", "").strip()
+            answer = parts[1].strip()
+        return answer, thought
+
+    accumulated_response: List[str] = []
+    accumulated_thought: List[str] = []
+    in_think_tag = False
+
+    req = http_client.build_request("POST", "/api/generate", json=payload)
+    res = await http_client.send(req, stream=True)
+    res.raise_for_status()
+
+    async for line in res.aiter_lines():
+        if not line:
+            continue
+        try:
+            chunk = json.loads(line)
+        except Exception:
+            continue
+
+        # 1. Check Ollama native 'thinking' field (DeepSeek-R1 / thinking models)
+        thinking_chunk = chunk.get("thinking", "")
+        if thinking_chunk:
+            accumulated_thought.append(thinking_chunk)
+            if thought_callback:
+                await thought_callback(thinking_chunk)
+
+        # 2. Check Ollama 'response' field
+        response_chunk = chunk.get("response", "")
+        if response_chunk:
+            if "<think>" in response_chunk:
+                in_think_tag = True
+                parts = response_chunk.split("<think>", 1)
+                if parts[0]:
+                    accumulated_response.append(parts[0])
+                    if token_callback:
+                        await token_callback(parts[0])
+                if len(parts) > 1 and parts[1]:
+                    if "</think>" in parts[1]:
+                        t_parts = parts[1].split("</think>", 1)
+                        accumulated_thought.append(t_parts[0])
+                        if thought_callback:
+                            await thought_callback(t_parts[0])
+                        in_think_tag = False
+                        if t_parts[1]:
+                            accumulated_response.append(t_parts[1])
+                            if token_callback:
+                                await token_callback(t_parts[1])
+                    else:
+                        accumulated_thought.append(parts[1])
+                        if thought_callback:
+                            await thought_callback(parts[1])
+                continue
+            elif in_think_tag:
+                if "</think>" in response_chunk:
+                    t_parts = response_chunk.split("</think>", 1)
+                    if t_parts[0]:
+                        accumulated_thought.append(t_parts[0])
+                        if thought_callback:
+                            await thought_callback(t_parts[0])
+                    in_think_tag = False
+                    if t_parts[1]:
+                        accumulated_response.append(t_parts[1])
+                        if token_callback:
+                            await token_callback(t_parts[1])
+                else:
+                    accumulated_thought.append(response_chunk)
+                    if thought_callback:
+                        await thought_callback(response_chunk)
+                continue
+            else:
+                accumulated_response.append(response_chunk)
+                if token_callback:
+                    await token_callback(response_chunk)
+
+    final_thought = "".join(accumulated_thought).strip()
+    final_answer = "".join(accumulated_response).strip()
+    return final_answer, final_thought
 
 
 def _sandbox_report(code_block: str, exec_output: Dict[str, Any]) -> Dict[str, Any]:
@@ -107,42 +216,140 @@ def _sandbox_report(code_block: str, exec_output: Dict[str, Any]) -> Dict[str, A
 
 
 async def _decode_and_route_node(state: AdaGraphState) -> Dict[str, Any]:
-    await emit_activity(state, "input", "Classifying the uploaded source and selecting a model route.")
+    await emit_activity(state, "input", "Classifying the uploaded source and selecting dynamic multi-model route.")
     raw_bytes = state.get("image_bytes")
     image_base64 = state.get("image_base64")
     if not raw_bytes and image_base64:
         clean_b64 = image_base64.split(",")[-1] if "," in image_base64 else image_base64
-        raw_bytes = base64.b64decode(clean_b64, validate=True)
-    route = "vision" if raw_bytes else "reasoning"
-    await emit_activity(state, "route", f"Selected {'Qwen2.5-VL vision' if route == 'vision' else 'DeepSeek-R1 reasoning'} route.", "complete")
+        try:
+            raw_bytes = base64.b64decode(clean_b64, validate=True)
+        except Exception:
+            raw_bytes = None
+
+    # Determine route: if visual asset is attached, engage dynamic multi-model pipeline
+    has_image = bool(raw_bytes)
+    route = "multimodal_vision" if has_image else "reasoning"
+
+    if route == "multimodal_vision":
+        await emit_activity(
+            state,
+            "route",
+            "Engaged Dynamic Multi-Model Pipeline: Qwen2.5-VL (Visual Scan) → Qdrant RAG → DeepSeek-R1 (Reasoning & Code Calculation).",
+            "complete",
+        )
+    else:
+        target_model = state.get("model_tag") or "deepseek-r1:8b"
+        await emit_activity(state, "route", f"Selected {target_model} direct engineering route.", "complete")
+
     return {"raw_bytes": raw_bytes, "route": route}
+
+
+async def _vision_node(state: AdaGraphState) -> Dict[str, Any]:
+    logger.info("LangGraph node vision -> Qwen2.5-VL scanning schematic")
+    await emit_activity(
+        state,
+        "vision",
+        "Qwen2.5-VL: Scanning schematic drawing, extracting equipment tags, valves, design pressures & piping topology...",
+    )
+    
+    # Prompt Qwen2.5-VL for comprehensive visual structural and component extraction
+    vision_prompt = (
+        f"Analyze this industrial engineering schematic / blueprint in detail. "
+        f"Identify and list all visible equipment tags (columns, vessels, heat exchangers), "
+        f"safety relief valves (PSVs), design & test pressures (PSI or bar), line numbers, and fluid directions. "
+        f"User inquiry context: {state['user_prompt']}"
+    )
+    
+    result = await parse_schematic_with_qwen(
+        state["raw_bytes"],
+        vision_prompt,
+        token_callback=None,
+    )
+    
+    analysis_text = result.get("analysis", "")
+
+    # Emit real-time vision_scan event so frontend displays visual extraction progress
+    ev_callback = state.get("event_callback")
+    if ev_callback and analysis_text:
+        await ev_callback("vision_scan", {
+            "model": result.get("model", "qwen2.5vl:7b"),
+            "analysis": analysis_text,
+            "status": result.get("status", "success"),
+        })
+
+    await emit_activity(
+        state,
+        "vision",
+        f"Qwen2.5-VL visual scan complete ({len(analysis_text)} chars extracted). Handing off to RAG & DeepSeek-R1.",
+        "complete" if result.get("status") == "success" else "error",
+    )
+    return {
+        "vision_result": result,
+        "visual_extraction_str": analysis_text,
+    }
 
 
 async def _retrieve_sops_node(state: AdaGraphState) -> Dict[str, Any]:
     logger.info("LangGraph node retrieve_sops -> local RAG")
     await emit_activity(state, "retrieval", "Searching the local SOP knowledge base for grounding clauses.")
-    matching_sops = rag_service.search_sops(state["user_prompt"], limit=2)
+
+    # Combine user prompt with visual extraction highlights for rich SOP search
+    search_query = state["user_prompt"]
+    visual_extraction = state.get("visual_extraction_str")
+    if visual_extraction:
+        search_query += f" {visual_extraction[:250]}"
+
+    matching_sops = rag_service.search_sops(search_query, limit=2)
+    if not matching_sops and visual_extraction:
+        # Fallback to user prompt alone
+        matching_sops = rag_service.search_sops(state["user_prompt"], limit=2)
+
     rag_context = "\n".join(f"- {s['id']} [{s['title']}]: {s['clause']}" for s in matching_sops)
+    ev_callback = state.get("event_callback")
+    if ev_callback:
+        await ev_callback("retrieval", {"sops": matching_sops, "count": len(matching_sops)})
     await emit_activity(state, "retrieval", f"Retrieved {len(matching_sops)} local SOP clause(s).", "complete")
     return {"matching_sops": matching_sops, "rag_context_str": rag_context}
 
 
-async def _vision_node(state: AdaGraphState) -> Dict[str, Any]:
-    logger.info("LangGraph node vision -> Qwen2.5-VL")
-    await emit_activity(state, "vision", "Sending the drawing to the local Qwen2.5-VL vision model.")
-    result = await parse_schematic_with_qwen(state["raw_bytes"], state["user_prompt"])
-    await emit_activity(state, "vision", "Vision analysis returned.", "complete" if result.get("status") == "success" else "error")
-    return {"vision_result": result}
-
-
 async def _reason_node(state: AdaGraphState) -> Dict[str, Any]:
-    logger.info("LangGraph node reason -> DeepSeek-R1")
-    await emit_activity(state, "reasoning", "Sending the grounded request to the local DeepSeek-R1 model.")
-    response = await call_deepseek_reasoner(
-        state["http_client"], state["user_prompt"], rag_context=state.get("rag_context_str")
+    target_model = state.get("model_tag") or REASONING_MODEL
+    logger.info("LangGraph node reason -> DeepSeek-R1 reasoning core")
+    await emit_activity(state, "reasoning", "DeepSeek-R1: Executing engineering reasoning & ASME calculation derivation...")
+
+    # Compose prompt containing user inquiry + visual extraction from Qwen2.5-VL
+    prompt_sections = []
+    visual_extraction = state.get("visual_extraction_str")
+    if visual_extraction:
+        prompt_sections.append(
+            f"[HIGH-PRECISION VISUAL SCHEMATIC EXTRACTION (from Qwen2.5-VL Vision)]:\n"
+            f"{visual_extraction}\n"
+        )
+    prompt_sections.append(f"USER INQUIRY:\n{state['user_prompt']}\n")
+    if visual_extraction:
+        prompt_sections.append(
+            "Synthesize the visual schematic observations with local SOP clauses. "
+            "Write your step-by-step reasoning, perform ASME Section VIII calculations, "
+            "and provide an executable Python calculation script in ```python ... ``` block to verify proof margins."
+        )
+    combined_prompt = "\n".join(prompt_sections)
+
+    response, thought = await call_deepseek_reasoner(
+        state["http_client"],
+        combined_prompt,
+        rag_context=state.get("rag_context_str"),
+        model_tag=target_model,
+        token_callback=state.get("token_callback"),
+        thought_callback=state.get("thought_callback"),
+        think_mode=state.get("think_mode", True),
     )
-    await emit_activity(state, "reasoning", "DeepSeek-R1 returned an analysis for review.", "complete")
-    return {"llm_response": response, "code_block": extract_python_code(response), "attempts": 0}
+    await emit_activity(state, "reasoning", "Model response & calculations generated.", "complete")
+    return {
+        "llm_response": response,
+        "llm_thought": thought,
+        "code_block": extract_python_code(response),
+        "attempts": 0,
+    }
 
 
 async def _execute_node(state: AdaGraphState) -> Dict[str, Any]:
@@ -153,6 +360,9 @@ async def _execute_node(state: AdaGraphState) -> Dict[str, Any]:
     logger.info("LangGraph node execute -> Docker sandbox")
     await emit_activity(state, "sandbox", "Running the generated calculation in an isolated Docker sandbox.")
     result = _sandbox_report(code_block, run_code_in_sandbox(code_block))
+    ev_callback = state.get("event_callback")
+    if ev_callback:
+        await ev_callback("sandbox", result)
     await emit_activity(state, "sandbox", f"Sandbox finished with status: {result.get('status', 'unknown')}.", "complete" if result.get("is_success") else "error")
     return {"sandbox_result": result}
 
@@ -260,6 +470,10 @@ async def _verification_node(state: AdaGraphState) -> Dict[str, Any]:
         "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }
 
+    ev_callback = state.get("event_callback")
+    if ev_callback:
+        await ev_callback("certificate", certificate)
+
     await emit_activity(
         state,
         "verification",
@@ -270,39 +484,34 @@ async def _verification_node(state: AdaGraphState) -> Dict[str, Any]:
 
 
 async def _finalize_node(state: AdaGraphState) -> Dict[str, Any]:
-    await emit_activity(state, "response", "Preparing the auditable response and evidence summary.", "complete")
-    if state.get("route") == "vision":
-        vision = state.get("vision_result", {})
-        result = {
-            "status": vision.get("status", "error"),
-            "routed_to": "vision_qwen2.5_vl",
-            "model": vision.get("model", "qwen2.5-vl:7b"),
-            "final_answer": vision.get("analysis", ""),
-            "error": vision.get("error"),
-            "code_executed": None,
-            "sandbox_result": {"executed": False},
-            "self_correction_attempts": 0,
-            "correction_history": [],
-            "grounding_sops": [],
-            "file_attestation": state.get("file_metadata"),
-        }
-    else:
-        sandbox = state.get("sandbox_result", {"executed": False})
-        cert = state.get("verification_certificate")
-        result = {
-            "status": "success",
-            "verification_status": "verified" if cert and cert.get("is_verified") else ("verified" if not sandbox.get("executed") or sandbox.get("is_success") else "unverified"),
-            "routed_to": "reasoning_deepseek_r1",
-            "model": REASONING_MODEL,
-            "final_answer": state.get("llm_response", ""),
-            "code_executed": state.get("code_block"),
-            "sandbox_result": sandbox,
-            "verification_certificate": cert,
-            "self_correction_attempts": state.get("attempts", 0),
-            "correction_history": state.get("correction_history", []),
-            "grounding_sops": state.get("matching_sops", []),
-            "file_attestation": state.get("file_metadata"),
-        }
+    await emit_activity(state, "response", "Preparing auditable engineering report and compliance artifacts.", "complete")
+    sandbox = state.get("sandbox_result", {"executed": False})
+    cert = state.get("verification_certificate")
+    is_multimodal = state.get("route") == "multimodal_vision"
+    target_model = state.get("model_tag") or REASONING_MODEL
+    if not state.get("think_mode", True) and (target_model == "deepseek-r1:8b" or "deepseek-r1" in target_model):
+        target_model = os.getenv("FAST_MODEL", "llama3:latest")
+
+    model_str = f"Qwen2.5-VL (Vision) + {target_model} (Reasoning)" if is_multimodal else target_model
+    routed_str = "multimodal_qwen_deepseek" if is_multimodal else f"reasoning_{target_model}"
+
+    result = {
+        "status": "success",
+        "verification_status": "verified" if cert and cert.get("is_verified") else ("verified" if not sandbox.get("executed") or sandbox.get("is_success") else "unverified"),
+        "routed_to": routed_str,
+        "model": model_str,
+        "final_answer": state.get("llm_response", ""),
+        "thought": state.get("llm_thought", ""),
+        "vision_analysis": state.get("visual_extraction_str"),
+        "vision_result": state.get("vision_result"),
+        "code_executed": state.get("code_block"),
+        "sandbox_result": sandbox,
+        "verification_certificate": cert,
+        "self_correction_attempts": state.get("attempts", 0),
+        "correction_history": state.get("correction_history", []),
+        "grounding_sops": state.get("matching_sops", []),
+        "file_attestation": state.get("file_metadata"),
+    }
     return {"result": result}
 
 
@@ -326,8 +535,8 @@ def _after_correction(state: AdaGraphState) -> str:
 def _build_ada_graph():
     workflow = StateGraph(AdaGraphState)
     workflow.add_node("decode_route", _decode_and_route_node)
-    workflow.add_node("retrieve_sops", _retrieve_sops_node)
     workflow.add_node("vision", _vision_node)
+    workflow.add_node("retrieve_sops", _retrieve_sops_node)
     workflow.add_node("reason", _reason_node)
     workflow.add_node("execute", _execute_node)
     workflow.add_node("correct", _correct_node)
@@ -335,9 +544,14 @@ def _build_ada_graph():
     workflow.add_node("finalize", _finalize_node)
     workflow.set_entry_point("decode_route")
     workflow.add_conditional_edges(
-        "decode_route", lambda state: state["route"], {"vision": "vision", "reasoning": "retrieve_sops"}
+        "decode_route",
+        lambda state: state["route"],
+        {
+            "multimodal_vision": "vision",
+            "reasoning": "retrieve_sops",
+        },
     )
-    workflow.add_edge("vision", "finalize")
+    workflow.add_edge("vision", "retrieve_sops")
     workflow.add_edge("retrieve_sops", "reason")
     workflow.add_conditional_edges("reason", _after_reasoning, {"execute": "execute", "verify": "verify"})
     workflow.add_conditional_edges("execute", _after_execution, {"correct": "correct", "verify": "verify"})
@@ -357,6 +571,11 @@ async def route_and_execute_task(
     image_base64: Optional[str] = None,
     file_metadata: Optional[Dict[str, Any]] = None,
     activity_callback: Optional[Any] = None,
+    token_callback: Optional[Any] = None,
+    thought_callback: Optional[Any] = None,
+    event_callback: Optional[Any] = None,
+    model_tag: Optional[str] = None,
+    think_mode: bool = True,
 ) -> Dict[str, Any]:
     """Run the complete dynamic routing and execution graph."""
     state = await ADA_GRAPH.ainvoke({
@@ -368,5 +587,75 @@ async def route_and_execute_task(
         "correction_history": [],
         "sandbox_result": {"executed": False},
         "activity_callback": activity_callback,
+        "token_callback": token_callback,
+        "thought_callback": thought_callback,
+        "event_callback": event_callback,
+        "model_tag": model_tag,
+        "think_mode": think_mode,
     })
     return state["result"]
+
+
+async def stream_route_and_execute_task(
+    user_prompt: str,
+    http_client: httpx.AsyncClient,
+    image_bytes: Optional[bytes] = None,
+    image_base64: Optional[str] = None,
+    file_metadata: Optional[Dict[str, Any]] = None,
+    model_tag: Optional[str] = None,
+    think_mode: bool = True,
+):
+    """
+    Asynchronous generator yielding typed real-time stream events:
+    - ('activity', {...})
+    - ('retrieval', {...})
+    - ('think', {'chunk': '...'})
+    - ('token', {'chunk': '...'})
+    - ('sandbox', {...})
+    - ('certificate', {...})
+    - ('done', {...})
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def on_activity(event: Dict[str, Any]):
+        await queue.put(("activity", event))
+
+    async def on_token(chunk: str):
+        await queue.put(("token", {"chunk": chunk}))
+
+    async def on_thought(chunk: str):
+        await queue.put(("think", {"chunk": chunk}))
+
+    async def on_event(ev_name: str, data: Dict[str, Any]):
+        await queue.put((ev_name, data))
+
+    task = asyncio.create_task(
+        route_and_execute_task(
+            user_prompt=user_prompt,
+            http_client=http_client,
+            image_bytes=image_bytes,
+            image_base64=image_base64,
+            file_metadata=file_metadata,
+            activity_callback=on_activity,
+            token_callback=on_token,
+            thought_callback=on_thought,
+            event_callback=on_event,
+            model_tag=model_tag,
+            think_mode=think_mode,
+        )
+    )
+
+    try:
+        while not task.done() or not queue.empty():
+            try:
+                ev_name, ev_data = await asyncio.wait_for(queue.get(), timeout=0.08)
+                yield ev_name, ev_data
+            except asyncio.TimeoutError:
+                continue
+
+        final_result = task.result()
+        yield "done", final_result
+    finally:
+        if not task.done():
+            task.cancel()
+
