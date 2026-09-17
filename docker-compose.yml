@@ -1,0 +1,60 @@
+services:
+  ada-vector-db:
+    image: qdrant/qdrant:v1.8.4
+    container_name: ada-vector-db
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334" # gRPC interface
+    volumes:
+      - qdrant_storage:/qdrant/storage:z
+    networks:
+      - ada-isolated-network
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  ada-backend-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ada-backend-core
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=ada-vector-db
+      - QDRANT_PORT=6333
+      - QDRANT_URL=http://ada-vector-db:6333
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_TIMEOUT_SECONDS=600.0
+      - OLLAMA_VISION_TIMEOUT=600.0
+      - OLLAMA_VISION_MODEL=qwen2.5vl:7b
+      - SANDBOX_TIMEOUT_SECONDS=60
+      - ADA_BGE_MODEL_PATH=/app/models/bge-large-en-v1.5
+      - ADA_BGE_MODEL_NAME=BAAI/bge-large-en-v1.5
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./models:/app/models:ro
+      - ./app:/app/app
+    depends_on:
+      ada-vector-db:
+        condition: service_healthy
+    networks:
+      - ada-isolated-network
+
+volumes:
+  qdrant_storage:
+    name: qdrant_storage
+
+networks:
+  ada-isolated-network:
+    name: ada-isolated-network
+    driver: bridge

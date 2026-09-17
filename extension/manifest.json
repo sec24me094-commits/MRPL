@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "ADA Workbench - Intranet RAG Ingester",
+  "version": "2.0.0",
+  "description": "Sovereign on-premise browser ingester. Extracts digital SOPs and plant documents from intranet tabs and securely indexes them into ADA Qdrant RAG with zero WAN egress.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Push to ADA RAG"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "http://*.mrpl.local/*",
+    "http://10.*/*",
+    "http://192.168.*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
